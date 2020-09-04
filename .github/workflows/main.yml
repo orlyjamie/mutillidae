@@ -1,0 +1,58 @@
+name: Run SAST Scan
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore: [ '.github/**' ]
+  pull_request:
+    branches: [ master ]
+    paths-ignore: [ '.github/**' ]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Run SAST Scan
+        env:
+          PROJECTLANG: 'php'
+        run: |
+          response=$(curl -sS --location --request POST 'https://api.dvuln.com/beta/v1/scan/sast' \
+          --header 'Authorization: ${{ secrets.API_TOKEN }}' \
+          --header 'Content-Type: application/json' \
+          --data-raw '{
+              "projectLang": "'${PROJECTLANG}'",
+              "repoUrl": "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/'${GITHUB_REPOSITORY}'.git",
+              "commitID": "'${GITHUB_SHA}'",
+              "repoBranchName": "'${GITHUB_REF#refs/heads/}'"
+          }');
+          echo "$response";
+          SCANID=$(echo "$response" | sed -nE 's/.*"scanID":"([^\"]*)",".*/\1/p');
+          if [ -z "$SCANID" ]; then exit 1; else export SCANID=$(echo $SCANID); echo "::set-env name=SCANID::$SCANID"; fi;
+
+      - name: Poll Scan Result
+        run: |          
+          echo "Scan ID: ${SCANID}"
+          status='IN_PROGRESS'; retry_count=15;
+          while [ "$status" == 'IN_PROGRESS' ] && [ $retry_count > 0 ];
+            do echo "$status - Waiting for scan $SCANID to complete"; sleep 60; let $((retry_count--));
+            response=$(curl -sS --location --request GET "https://api.dvuln.com/beta/v1/scan/${SCANID}" --header 'Authorization: ${{ secrets.API_TOKEN }}');
+            status=$(echo "$response" | sed -nE 's/.*"status":"([^\"]*)",".*/\1/p');
+          done; if [ $retry_count == 0 ]; then echo "Timeout. Scan is taking longer than expected"; exit 1; fi; 
+          if [ $status != "COMPLETED" ]; then echo "Scan is $status"; exit 1; else echo "Scan has been completed, getting result.."; fi; 
+          curl -sS --location --request GET "https://api.dvuln.com/beta/v1/scan/${SCANID}/issues" --header 'Authorization: ${{ secrets.API_TOKEN }}' > scanresult.json
+ 
+      - name: Upload Scan Result Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: result
+          path: scanresult.json
+
+      - name: Create GitHub Check
+        run: |
+          ISSUES_URL="https://api.dvuln.com/beta/v1/scan/${SCANID}/issues"
+          CHECK_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs"
+          curl -XPOST $CHECK_URL -H "Authorization: Token ${{ secrets.GITHUB_TOKEN }}" -H "accept: application/vnd.github.antiope-preview+json" -H "Content-Type: application/json" -d "{\"name\": \"SAST Scan\", \"head_sha\": \"${GITHUB_REF}\", \"external_id\": \"SASTScan\", \"details_url\": \"${ISSUES_URL}\", \"status\": \"completed\", \"conclusion\": \"action_required\", \"output\": {\"title\": \"SAST Scan Result\", \"summary\": \"Issues are stored as workflow artifacts or perform GET ${ISSUES_URL} to retrieve the issues\"}}"
